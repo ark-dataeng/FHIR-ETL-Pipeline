@@ -1,6 +1,6 @@
 # Data Naming Standards
 
-**Project:** Healthcare Data Engineering Portfolio — Silver Layer
+**Project:** Healthcare Data Engineering Portfolio — Silver and Gold Layers
 **Version:** 1.1
 **Last Updated:** September 2026
 
