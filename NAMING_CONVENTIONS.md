@@ -10,7 +10,7 @@
 
 This document defines the naming conventions used across all Silver layer tables in the Databricks healthcare data pipeline. Consistent naming makes schemas self-documenting, reduces ambiguity, and improves collaboration between data engineers, analysts, and AI agents that consume this schema.
 
-> **For AI Agents:** This document is structured as machine-readable tables. Each rule has an ID (e.g., `R1`) and can be validated programmatically. See the [Validation Checklist](#validation-checklist) at the end.
+> **For Validation Only:** This document is structured as machine-readable tables. Each rule has an ID (e.g., `R1`) and can be validated programmatically. See the [Validation Checklist](#validation-checklist) at the end.
 
 ---
 
@@ -201,7 +201,7 @@ Columns that could belong to multiple resources, or that would be ambiguous with
 
 ## Validation Checklist
 
-> **For AI Agents:** To validate a new table against these standards, apply the checks below in order. Each check references a rule above.
+> **For Validation Only** To validate a new table against these standards, apply the checks below in order. Each check references a rule above.
 
 | Check ID | Rule | Validation Logic |
 |---|---|---|
@@ -215,5 +215,3 @@ Columns that could belong to multiple resources, or that would be ambiguous with
 | V8 | R8 | If column name would be ambiguous across resources → prefix with resource type |
 | V9 | General | Column name must be lowercase snake_case, no spaces or special characters |
 | V10 | General | Boolean columns must start with `is_` and end with `_flag` |
-
-**AI Agent Prompt Template:**
