@@ -201,7 +201,7 @@ Columns that could belong to multiple resources, or that would be ambiguous with
 
 ## Validation Checklist
 
-> **For Validation Only** To validate a new table against these standards, apply the checks below in order. Each check references a rule above.
+> **For Validation Only:** To validate a new table against these standards, apply the checks below in order. Each check references a rule above.
 
 | Check ID | Rule | Validation Logic |
 |---|---|---|
