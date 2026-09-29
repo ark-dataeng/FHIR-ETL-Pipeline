@@ -2,7 +2,7 @@
 
 **Project:** Healthcare Data Engineering Portfolio — Silver Layer
 **Version:** 1.1
-**Last Updated:** 2025
+**Last Updated:** September 2026
 
 ---
 
