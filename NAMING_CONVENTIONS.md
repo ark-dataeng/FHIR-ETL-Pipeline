@@ -8,7 +8,7 @@
 
 ## Purpose
 
-This document defines the naming conventions used across all Silver layer tables in the Databricks healthcare data pipeline. Consistent naming makes schemas self-documenting, reduces ambiguity, and improves collaboration between data engineers, analysts, and AI agents that consume this schema.
+This document defines the naming conventions used across all Silver and Gold layer tables in the Databricks healthcare data pipeline. Consistent naming makes schemas self-documenting, reduces ambiguity, and improves collaboration between data engineers and analysts (both are me, actually).
 
 > **For Validation Only:** This document is structured as machine-readable tables. Each rule has an ID (e.g., `R1`) and can be validated programmatically. See the [Validation Checklist](#validation-checklist) at the end.
 
