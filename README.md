@@ -62,8 +62,8 @@ For full details, see the data design document below.
 The complete data design document is available at [`docs/data_design`](docs/data-design/Synthea_FHIR_Silver_Layer_Data_Design_Document.ods). It covers:
 
 - **Source systems** and FHIR version (R4)
-- **Grain definitions** for each Silver and Gold table
-- **Partitioning and Z-Ordering** strategy
+- **Grain definitions** for each Silver table (Gold TBD)
+- **Datatype information** for each Silver table (Gold TBD)
 
 ### Layer schemas
 
