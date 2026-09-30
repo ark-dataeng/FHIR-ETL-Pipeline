@@ -4,7 +4,7 @@ A Databricks-based medallion architecture (Bronze -> Silver -> Gold) ETL pipelin
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [Overview](#overview)
 - [Architecture](#architecture)
