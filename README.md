@@ -24,16 +24,16 @@ This project implements an end-to-end ETL pipeline for FHIR healthcare data on D
 - Support for core FHIR resources (Patient, Encounter, Observation, Condition, MedicationRequest, etc.)
 - Parameterized notebooks for data ingestion
 - Column naming standards applied consistently across layers
-- Data design document covering entity relationships
+- Data design document covering column information for each Silver layer table
 
 
 **What is to be added:**
+- Architecture diagram and entity relationship model across FHIR resource types
 - Schema evolution and data quality enforcement via Delta constraints and DDL notebooks
 - Data ingestion jobs that run on a regular schedule. Currently, the notebooks must be triggered manually or by Auto Loader
 - A finalized gold layer that is ready for consumption (with data quality standards and PHI/PII handling and masking)
 - A consistent CI/CD process via Terraform or some other tool, as well as stored environment variables
 - Partitioning, Z-ordering, and SCD strategies
-- Entity relationship model across FHIR resource types
 - Data quality expectations and quarantine patterns, with Deequ as a start
 - Testing and monitoring of data flow and quality
 
