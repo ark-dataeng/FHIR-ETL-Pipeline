@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Bronze Layer: Synthea FHIR Ingestion
 # MAGIC
@@ -12,9 +16,9 @@ from pyspark.sql.functions import col, current_timestamp, parse_json
 # COMMAND ----------
 
 # Configuration
-SOURCE_PATH = "/Volumes/Workspace/data/fhir"
-CHECKPOINT_PATH = "/Volumes/workspace/default/healthcare_data/_checkpoints/synthea_base/"
-BRONZE_TABLE = "workspace.fhir_rawz.synthea_base"
+SOURCE_PATH = "/Volumes/workspace/default/data/fhir/"
+CHECKPOINT_PATH = "/Volumes/workspace/default/data/checkpoints/"
+BRONZE_TABLE = "workspace.fhir_rawz.bundle_base"
 
 # COMMAND ----------
 

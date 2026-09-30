@@ -1,258 +1,417 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Silver Layer: FHIR Resource Flattening
 # MAGIC
-# MAGIC This notebook flattens the nested FHIR Bundles from Bronze into separate Silver tables.
-# MAGIC Each resource type (Patient, Encounter, Condition, etc.) is written to its own Delta table.
+# MAGIC Flattens nested FHIR Bundles from `workspace.fhir_rawz.bundle_base` into separate Silver tables
+# MAGIC in `workspace.fhir_cnfz`. Each resource type gets its own table.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, explode, current_timestamp, to_date, to_timestamp, when, lit
+from pyspark.sql.functions import col, explode, current_timestamp, when, lit, variant_get, from_json, schema_of_json, schema_of_variant_agg
 from pyspark.sql.types import StringType, DoubleType, IntegerType, BooleanType, DateType, TimestampType
 
 # COMMAND ----------
 
-BRONZE_TABLE = "workspace.default.bronze_synthea_raw"
-SILVER_SCHEMA = "workspace.default"
+# Configuration
+BRONZE_TABLE = "workspace.fhir_rawz.bundle_base"
+SILVER_SCHEMA = "workspace.fhir_cnfz"
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Read Bronze and Explode Bundle Entries
+# MAGIC
+# MAGIC FHIR Bundles contain a nested `entry` array. We explode it to get one row per resource.
 
 # COMMAND ----------
 
-bronze_df = spark.table(BRONZE_TABLE)
+# Build resources_df directly from the VARIANT — no schema inference, no from_json
+resources_df = spark.sql(f"""
+    SELECT
+        variant_get(e.value, '$.resource',              'variant')  AS resource,
+        variant_get(e.value, '$.resource.resourceType', 'string')   AS resource_type,
+        b.source_file_nm
+    FROM {BRONZE_TABLE} AS b,
+    LATERAL variant_explode(b.raw_bundle:entry) AS e
+""")
 
-# Explode the entry array to get one row per FHIR resource
-entries_df = bronze_df.select(
-    explode(col("raw_bundle.entry")).alias("entry"),
-    col("source_file_nm")
-)
+print("Resource count:", resources_df.count())
+resources_df.printSchema()
 
-# Extract the resource object and resourceType
-resources_df = entries_df.select(
-    col("entry.resource").alias("resource"),
-    col("entry.resource.resourceType").alias("resource_type"),
-    col("source_file_nm")
-)
+# Cache for performance - not supported on serverless
+# resources_df.cache()
+
+# Write exploded resources to a stg (replaces cache)
+staging_table_name = f"{SILVER_SCHEMA}.bundle_stg"
+resources_df.write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(staging_table_name)
+
+# Read back from the staging table
+resources_df = spark.table(staging_table_name)
+
+
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Helper: Write Silver Table
+# MAGIC ## Helper Function: Write Silver Table
 
 # COMMAND ----------
 
-def write_silver_table(df, table_name, columns):
-    """
-    Selects and renames columns, then writes to a Silver Delta table.
-    """
-    silver_df = df.select([col(c).alias(name) for c, name in columns])
-    
-    # Add pipeline metadata
-    silver_df = silver_df.withColumn("ingest_ts", current_timestamp()) \
-                         .withColumn("source_file_nm", col("source_file_nm"))
-    
+def write_silver_table(df, table_name):
+    """Write a DataFrame to a Silver table with ingest metadata."""
+    silver_df = df.withColumn("ingest_ts", current_timestamp())
+    full_name = f"{SILVER_SCHEMA}.{table_name}"
     silver_df.write.format("delta") \
         .mode("overwrite") \
         .option("overwriteSchema", "true") \
-        .saveAsTable(f"{SILVER_SCHEMA}.{table_name}")
+        .saveAsTable(full_name)
+    print(f"Wrote {silver_df.count()} rows to {full_name}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## silver.patient
+# MAGIC ## fhir_cnfz.patient
+# MAGIC
+# MAGIC Flatten Patient resources. PHI columns are flagged for masking.
 
 # COMMAND ----------
 
-patient_df = resources_df.filter(col("resource_type") == "Patient")
+patient_df = resources_df.filter(col("resource_type") == "Patient").select(
+    variant_get(col("resource"), "$.id", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.identifier[0].value", "string").alias("medical_record_num"),
+    variant_get(col("resource"), "$.name[0].given[0]", "string").alias("first_nm"),
+    variant_get(col("resource"), "$.name[0].family", "string").alias("last_nm"),
+    variant_get(col("resource"), "$.name[0].prefix[0]", "string").alias("prefix_nm"),
+    variant_get(col("resource"), "$.gender", "string").alias("gender_cd"),
+    variant_get(col("resource"), "$.birthDate", "string").alias("birth_dt"),
+    variant_get(col("resource"), "$.maritalStatus.text", "string").alias("marital_status_cd"),
+    variant_get(col("resource"), "$.communication[0].language.text", "string").alias("language_cd"),
+    variant_get(col("resource"), "$.telecom[0].value", "string").alias("phone_num"),
+    variant_get(col("resource"), "$.address[0].line[0]", "string").alias("patient_address_line"),
+    variant_get(col("resource"), "$.address[0].city", "string").alias("patient_city"),
+    variant_get(col("resource"), "$.address[0].state", "string").alias("patient_state_cd"),
+    variant_get(col("resource"), "$.address[0].postalCode", "string").alias("patient_postal_cd"),
+    variant_get(col("resource"), "$.address[0].country", "string").alias("patient_country_cd"),
+    variant_get(col("resource"), "$.multipleBirthBoolean", "boolean").alias("is_multiple_birth_flag"),
+    col("source_file_nm"),
+)
 
-patient_columns = [
-    ("resource.id", "patient_id"),
-    ("resource.identifier[type='MR'].value", "medical_record_num"),
-    ("resource.identifier[type='SS'].value", "social_security_num"),
-    ("resource.identifier[type='DL'].value", "drivers_license_num"),
-    ("resource.identifier[type='PPN'].value", "passport_num"),
-    ("resource.name[0].given[0]", "first_nm"),
-    ("resource.name[0].family", "last_nm"),
-    ("resource.name[0].prefix[0]", "prefix_nm"),
-    ("resource.gender", "gender_cd"),
-    ("resource.birthDate", "birth_dt"),
-    ("resource.extension[url='http://hl7.org/fhir/us/core/StructureDefinition/us-core-race'].extension[url='ombCategory'].valueCoding.display", "race_cd"),
-    ("resource.extension[url='http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity'].extension[url='ombCategory'].valueCoding.display", "ethnicity_cd"),
-    ("resource.extension[url='http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex'].valueCode", "birth_sex_cd"),
-    ("resource.maritalStatus.text", "marital_status_cd"),
-    ("resource.communication[0].language.text", "language_cd"),
-    ("resource.telecom[system='phone'].value", "phone_num"),
-    ("resource.address[0].line[0]", "patient_address_line"),
-    ("resource.address[0].city", "patient_city"),
-    ("resource.address[0].state", "patient_state_cd"),
-    ("resource.address[0].postalCode", "patient_postal_cd"),
-    ("resource.address[0].country", "patient_country_cd"),
-    ("resource.address[0].extension[url='http://hl7.org/fhir/StructureDefinition/geolocation'].extension[url='latitude'].valueDecimal", "patient_lat"),
-    ("resource.address[0].extension[url='http://hl7.org/fhir/StructureDefinition/geolocation'].extension[url='longitude'].valueDecimal", "patient_long"),
-    ("resource.multipleBirthBoolean", "is_multiple_birth_flag"),
-    ("resource.extension[url='http://hl7.org/fhir/StructureDefinition/patient-mothersMaidenName'].valueString", "mothers_maiden_nm"),
-]
-
-write_silver_table(patient_df, "silver_patient", patient_columns)
+write_silver_table(patient_df, "patient")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## silver.encounter
+# MAGIC ## fhir_cnfz.encounter
 
 # COMMAND ----------
 
-encounter_df = resources_df.filter(col("resource_type") == "Encounter")
+encounter_df = resources_df.filter(col("resource_type") == "Encounter").select(
+    variant_get(col("resource"), "$.id", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.class.code", "string").alias("class_cd"),
+    variant_get(col("resource"), "$.type[0].coding[0].code", "string").alias("encounter_type_cd"),
+    variant_get(col("resource"), "$.type[0].coding[0].display", "string").alias("encounter_type_desc"),
+    variant_get(col("resource"), "$.type[0].text", "string").alias("encounter_type_text"),
+    variant_get(col("resource"), "$.period.start", "string").alias("period_start_ts"),
+    variant_get(col("resource"), "$.period.end", "string").alias("period_end_ts"),
+    variant_get(col("resource"), "$.reasonCode[0].coding[0].code", "string").alias("reason_cd"),
+    variant_get(col("resource"), "$.reasonCode[0].coding[0].display", "string").alias("reason_desc"),
+    variant_get(col("resource"), "$.participant[0].individual.reference", "string").alias("practitioner_id"),
+    variant_get(col("resource"), "$.participant[0].individual.display", "string").alias("practitioner_nm"),
+    variant_get(col("resource"), "$.location[0].location.reference", "string").alias("location_id"),
+    variant_get(col("resource"), "$.location[0].location.display", "string").alias("location_nm"),
+    variant_get(col("resource"), "$.serviceProvider.reference", "string").alias("organization_id"),
+    variant_get(col("resource"), "$.serviceProvider.display", "string").alias("organization_nm"),
+    col("source_file_nm"),
+)
 
-encounter_columns = [
-    ("resource.id", "encounter_id"),
-    ("resource.subject.reference", "patient_id"),
-    ("resource.status", "status_cd"),
-    ("resource.class.code", "class_cd"),
-    ("resource.class.system", "class_system_cd"),
-    ("resource.type[0].coding[0].code", "encounter_type_cd"),
-    ("resource.type[0].coding[0].display", "encounter_type_desc"),
-    ("resource.type[0].text", "encounter_type_text"),
-    ("resource.period.start", "period_start_ts"),
-    ("resource.period.end", "period_end_ts"),
-    ("resource.reasonCode[0].coding[0].code", "reason_cd"),
-    ("resource.reasonCode[0].coding[0].display", "reason_desc"),
-    ("resource.participant[0].individual.reference", "practitioner_id"),
-    ("resource.participant[0].individual.display", "practitioner_nm"),
-    ("resource.location[0].location.reference", "location_id"),
-    ("resource.location[0].location.display", "location_nm"),
-    ("resource.serviceProvider.reference", "organization_id"),
-    ("resource.serviceProvider.display", "organization_nm"),
-]
-
-write_silver_table(encounter_df, "silver_encounter", encounter_columns)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## silver.condition
-
-# COMMAND ----------
-
-condition_df = resources_df.filter(col("resource_type") == "Condition")
-
-condition_columns = [
-    ("resource.id", "condition_id"),
-    ("resource.subject.reference", "patient_id"),
-    ("resource.encounter.reference", "encounter_id"),
-    ("resource.clinicalStatus.coding[0].code", "clinical_status_cd"),
-    ("resource.verificationStatus.coding[0].code", "verification_status_cd"),
-    ("resource.category[0].coding[0].code", "category_cd"),
-    ("resource.code.coding[0].code", "code_cd"),
-    ("resource.code.coding[0].system", "code_system_cd"),
-    ("resource.code.coding[0].display", "code_desc"),
-    ("resource.code.text", "code_text"),
-    ("resource.onsetDateTime", "onset_ts"),
-    ("resource.abatementDateTime", "abatement_ts"),
-    ("resource.recordedDate", "recorded_dt"),
-]
-
-write_silver_table(condition_df, "silver_condition", condition_columns)
-
-# Add derived is_active_flag
-spark.sql(f"""
-    ALTER TABLE {SILVER_SCHEMA}.silver_condition
-    ADD COLUMN is_active_flag BOOLEAN
-""")
-
-spark.sql(f"""
-    UPDATE {SILVER_SCHEMA}.silver_condition
-    SET is_active_flag = (clinical_status_cd = 'active')
-""")
+write_silver_table(encounter_df, "encounter")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## silver.medication_request
+# MAGIC ## fhir_cnfz.condition
 
 # COMMAND ----------
 
-medication_df = resources_df.filter(col("resource_type") == "MedicationRequest")
+condition_df = resources_df.filter(col("resource_type") == "Condition").select(
+    variant_get(col("resource"), "$.id", "string").alias("condition_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.clinicalStatus.coding[0].code", "string").alias("clinical_status_cd"),
+    variant_get(col("resource"), "$.verificationStatus.coding[0].code", "string").alias("verification_status_cd"),
+    variant_get(col("resource"), "$.category[0].coding[0].code", "string").alias("category_cd"),
+    variant_get(col("resource"), "$.code.coding[0].code", "string").alias("code_cd"),
+    variant_get(col("resource"), "$.code.coding[0].display", "string").alias("code_desc"),
+    variant_get(col("resource"), "$.code.text", "string").alias("code_text"),
+    variant_get(col("resource"), "$.onsetDateTime", "string").alias("onset_ts"),
+    variant_get(col("resource"), "$.abatementDateTime", "string").alias("abatement_ts"),
+    variant_get(col("resource"), "$.recordedDate", "string").alias("recorded_dt"),
+    col("source_file_nm"),
+).withColumn(
+    "is_active_flag",
+    when(col("clinical_status_cd") == "active", True).otherwise(False)
+)
 
-medication_columns = [
-    ("resource.id", "medication_request_id"),
-    ("resource.subject.reference", "patient_id"),
-    ("resource.encounter.reference", "encounter_id"),
-    ("resource.status", "status_cd"),
-    ("resource.intent", "intent_cd"),
-    ("resource.medicationCodeableConcept.coding[0].code", "medication_cd"),
-    ("resource.medicationCodeableConcept.coding[0].system", "medication_system_cd"),
-    ("resource.medicationCodeableConcept.coding[0].display", "medication_desc"),
-    ("resource.medicationCodeableConcept.text", "medication_text"),
-    ("resource.authoredOn", "authored_ts"),
-    ("resource.requester.reference", "requester_id"),
-    ("resource.requester.display", "requester_nm"),
-    ("resource.dosageInstruction[0].text", "dosage_text"),
-    ("resource.dosageInstruction[0].asNeededBoolean", "is_as_needed_flag"),
-]
-
-write_silver_table(medication_df, "silver_medication_request", medication_columns)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## silver.observation
-
-# COMMAND ----------
-
-observation_df = resources_df.filter(col("resource_type") == "Observation")
-
-observation_columns = [
-    ("resource.id", "observation_id"),
-    ("resource.subject.reference", "patient_id"),
-    ("resource.encounter.reference", "encounter_id"),
-    ("resource.status", "status_cd"),
-    ("resource.category[0].coding[0].code", "category_cd"),
-    ("resource.code.coding[0].code", "code_cd"),
-    ("resource.code.coding[0].display", "code_desc"),
-    ("resource.effectiveDateTime", "effective_ts"),
-    ("resource.issued", "issued_ts"),
-    ("resource.valueQuantity.value", "value_num"),
-    ("resource.valueQuantity.unit", "value_unit"),
-    ("resource.valueQuantity.code", "value_unit_cd"),
-    ("resource.valueString", "value_text"),
-    ("resource.valueCodeableConcept.text", "value_desc"),
-]
-
-write_silver_table(observation_df, "silver_observation", observation_columns)
+write_silver_table(condition_df, "condition")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## silver.claim
+# MAGIC ## fhir_cnfz.medication_request
 
 # COMMAND ----------
 
-claim_df = resources_df.filter(col("resource_type") == "Claim")
+medication_df = resources_df.filter(col("resource_type") == "MedicationRequest").select(
+    variant_get(col("resource"), "$.id", "string").alias("medication_request_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.intent", "string").alias("intent_cd"),
+    variant_get(col("resource"), "$.medicationCodeableConcept.coding[0].code", "string").alias("medication_cd"),
+    variant_get(col("resource"), "$.medicationCodeableConcept.coding[0].display", "string").alias("medication_desc"),
+    variant_get(col("resource"), "$.medicationCodeableConcept.text", "string").alias("medication_text"),
+    variant_get(col("resource"), "$.authoredOn", "string").alias("authored_ts"),
+    variant_get(col("resource"), "$.requester.reference", "string").alias("requester_id"),
+    variant_get(col("resource"), "$.requester.display", "string").alias("requester_nm"),
+    variant_get(col("resource"), "$.dosageInstruction[0].text", "string").alias("dosage_text"),
+    variant_get(col("resource"), "$.dosageInstruction[0].asNeededBoolean", "boolean").alias("is_as_needed_flag"),
+    col("source_file_nm"),
+)
 
-claim_columns = [
-    ("resource.id", "claim_id"),
-    ("resource.patient.reference", "patient_id"),
-    ("resource.status", "status_cd"),
-    ("resource.use", "use_cd"),
-    ("resource.type.coding[0].code", "claim_type_cd"),
-    ("resource.billablePeriod.start", "billable_start_ts"),
-    ("resource.billablePeriod.end", "billable_end_ts"),
-    ("resource.created", "created_ts"),
-    ("resource.provider.reference", "provider_id"),
-    ("resource.provider.display", "provider_nm"),
-    ("resource.facility.reference", "facility_id"),
-    ("resource.facility.display", "facility_nm"),
-    ("resource.priority.coding[0].code", "priority_cd"),
-    ("resource.insurance[0].coverage.display", "insurance_coverage_nm"),
-    ("resource.total.value", "total_amt"),
-    ("resource.total.currency", "total_currency_cd"),
-]
+write_silver_table(medication_df, "medication_request")
 
-write_silver_table(claim_df, "silver_claim", claim_columns)
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.observation
+
+# COMMAND ----------
+
+observation_df = resources_df.filter(col("resource_type") == "Observation").select(
+    variant_get(col("resource"), "$.id", "string").alias("observation_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.category[0].coding[0].code", "string").alias("category_cd"),
+    variant_get(col("resource"), "$.code.coding[0].code", "string").alias("code_cd"),
+    variant_get(col("resource"), "$.code.coding[0].display", "string").alias("code_desc"),
+    variant_get(col("resource"), "$.effectiveDateTime", "string").alias("effective_ts"),
+    variant_get(col("resource"), "$.issued", "string").alias("issued_ts"),
+    variant_get(col("resource"), "$.valueQuantity.value", "double").alias("value_num"),
+    variant_get(col("resource"), "$.valueQuantity.unit", "string").alias("value_unit"),
+    variant_get(col("resource"), "$.valueString", "string").alias("value_text"),
+    variant_get(col("resource"), "$.valueCodeableConcept.text", "string").alias("value_desc"),
+    col("source_file_nm"),
+)
+
+write_silver_table(observation_df, "observation")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.claim
+
+# COMMAND ----------
+
+claim_df = resources_df.filter(col("resource_type") == "Claim").select(
+    variant_get(col("resource"), "$.id", "string").alias("claim_id"),
+    variant_get(col("resource"), "$.patient.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.use", "string").alias("use_cd"),
+    variant_get(col("resource"), "$.type.coding[0].code", "string").alias("claim_type_cd"),
+    variant_get(col("resource"), "$.billablePeriod.start", "string").alias("billable_start_ts"),
+    variant_get(col("resource"), "$.billablePeriod.end", "string").alias("billable_end_ts"),
+    variant_get(col("resource"), "$.created", "string").alias("created_ts"),
+    variant_get(col("resource"), "$.provider.reference", "string").alias("provider_id"),
+    variant_get(col("resource"), "$.provider.display", "string").alias("provider_nm"),
+    variant_get(col("resource"), "$.facility.reference", "string").alias("facility_id"),
+    variant_get(col("resource"), "$.facility.display", "string").alias("facility_nm"),
+    variant_get(col("resource"), "$.priority.coding[0].code", "string").alias("priority_cd"),
+    variant_get(col("resource"), "$.insurance[0].coverage.display", "string").alias("insurance_coverage_nm"),
+    variant_get(col("resource"), "$.total.value", "double").alias("total_amt"),
+    variant_get(col("resource"), "$.total.currency", "string").alias("total_currency_cd"),
+    col("source_file_nm"),
+)
+
+write_silver_table(claim_df, "claim")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.explanation_of_benefit
+
+# COMMAND ----------
+
+eob_df = resources_df.filter(col("resource_type") == "ExplanationOfBenefit").select(
+    variant_get(col("resource"), "$.id", "string").alias("eob_id"),
+    variant_get(col("resource"), "$.patient.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.claim.reference", "string").alias("claim_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.use", "string").alias("use_cd"),
+    variant_get(col("resource"), "$.type.coding[0].code", "string").alias("eob_type_cd"),
+    variant_get(col("resource"), "$.outcome", "string").alias("outcome_cd"),
+    variant_get(col("resource"), "$.billablePeriod.start", "string").alias("billable_start_ts"),
+    variant_get(col("resource"), "$.billablePeriod.end", "string").alias("billable_end_ts"),
+    variant_get(col("resource"), "$.created", "string").alias("created_ts"),
+    variant_get(col("resource"), "$.insurer.display", "string").alias("insurer_nm"),
+    variant_get(col("resource"), "$.provider.reference", "string").alias("provider_id"),
+    variant_get(col("resource"), "$.facility.reference", "string").alias("facility_id"),
+    variant_get(col("resource"), "$.facility.display", "string").alias("facility_nm"),
+    variant_get(col("resource"), "$.total[0].amount.value", "double").alias("total_submitted_amt"),
+    variant_get(col("resource"), "$.payment.amount.value", "double").alias("payment_amt"),
+    col("source_file_nm"),
+)
+
+write_silver_table(eob_df, "explanation_of_benefit")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.care_team
+
+# COMMAND ----------
+
+care_team_df = resources_df.filter(col("resource_type") == "CareTeam").select(
+    variant_get(col("resource"), "$.id", "string").alias("care_team_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.period.start", "string").alias("period_start_ts"),
+    variant_get(col("resource"), "$.reasonCode[0].coding[0].code", "string").alias("reason_cd"),
+    variant_get(col("resource"), "$.reasonCode[0].coding[0].display", "string").alias("reason_desc"),
+    variant_get(col("resource"), "$.managingOrganization[0].reference", "string").alias("organization_id"),
+    variant_get(col("resource"), "$.managingOrganization[0].display", "string").alias("organization_nm"),
+    col("source_file_nm"),
+)
+
+write_silver_table(care_team_df, "care_team")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.care_plan
+
+# COMMAND ----------
+
+care_plan_df = resources_df.filter(col("resource_type") == "CarePlan").select(
+    variant_get(col("resource"), "$.id", "string").alias("care_plan_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.intent", "string").alias("intent_cd"),
+    variant_get(col("resource"), "$.category[0].coding[0].code", "string").alias("category_cd"),
+    variant_get(col("resource"), "$.period.start", "string").alias("period_start_ts"),
+    variant_get(col("resource"), "$.careTeam[0].reference", "string").alias("care_team_id"),
+    col("source_file_nm"),
+)
+
+write_silver_table(care_plan_df, "care_plan")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.diagnostic_report
+
+# COMMAND ----------
+
+diagnostic_df = resources_df.filter(col("resource_type") == "DiagnosticReport").select(
+    variant_get(col("resource"), "$.id", "string").alias("diagnostic_report_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.category[0].coding[0].code", "string").alias("category_cd"),
+    variant_get(col("resource"), "$.code.coding[0].code", "string").alias("code_cd"),
+    variant_get(col("resource"), "$.code.coding[0].display", "string").alias("code_desc"),
+    variant_get(col("resource"), "$.effectiveDateTime", "string").alias("effective_ts"),
+    variant_get(col("resource"), "$.issued", "string").alias("issued_ts"),
+    variant_get(col("resource"), "$.performer[0].reference", "string").alias("performer_id"),
+    variant_get(col("resource"), "$.performer[0].display", "string").alias("performer_nm"),
+    variant_get(col("resource"), "$.presentedForm[0].data", "string").alias("presented_form_data"),
+    col("source_file_nm"),
+)
+
+write_silver_table(diagnostic_df, "diagnostic_report")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.document_reference
+
+# COMMAND ----------
+
+document_df = resources_df.filter(col("resource_type") == "DocumentReference").select(
+    variant_get(col("resource"), "$.id", "string").alias("document_reference_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.context.encounter[0].reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.type.coding[0].code", "string").alias("doc_type_cd"),
+    variant_get(col("resource"), "$.type.coding[0].display", "string").alias("doc_type_desc"),
+    variant_get(col("resource"), "$.date", "string").alias("document_ts"),
+    variant_get(col("resource"), "$.author[0].reference", "string").alias("author_id"),
+    variant_get(col("resource"), "$.author[0].display", "string").alias("author_nm"),
+    variant_get(col("resource"), "$.custodian.reference", "string").alias("custodian_id"),
+    variant_get(col("resource"), "$.custodian.display", "string").alias("custodian_nm"),
+    variant_get(col("resource"), "$.content[0].attachment.contentType", "string").alias("content_type_cd"),
+    variant_get(col("resource"), "$.content[0].attachment.data", "string").alias("content_data"),
+    col("source_file_nm"),
+)
+
+write_silver_table(document_df, "document_reference")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.immunization
+
+# COMMAND ----------
+
+immunization_df = resources_df.filter(col("resource_type") == "Immunization").select(
+    variant_get(col("resource"), "$.id", "string").alias("immunization_id"),
+    variant_get(col("resource"), "$.patient.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.vaccineCode.coding[0].code", "string").alias("vaccine_cd"),
+    variant_get(col("resource"), "$.vaccineCode.coding[0].display", "string").alias("vaccine_desc"),
+    variant_get(col("resource"), "$.occurrenceDateTime", "string").alias("occurrence_ts"),
+    variant_get(col("resource"), "$.primarySource", "boolean").alias("is_primary_source_flag"),
+    variant_get(col("resource"), "$.location.reference", "string").alias("location_id"),
+    variant_get(col("resource"), "$.location.display", "string").alias("location_nm"),
+    col("source_file_nm"),
+)
+
+write_silver_table(immunization_df, "immunization")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## fhir_cnfz.procedure
+
+# COMMAND ----------
+
+procedure_df = resources_df.filter(col("resource_type") == "Procedure").select(
+    variant_get(col("resource"), "$.id", "string").alias("procedure_id"),
+    variant_get(col("resource"), "$.subject.reference", "string").alias("patient_id"),
+    variant_get(col("resource"), "$.encounter.reference", "string").alias("encounter_id"),
+    variant_get(col("resource"), "$.status", "string").alias("status_cd"),
+    variant_get(col("resource"), "$.code.coding[0].code", "string").alias("code_cd"),
+    variant_get(col("resource"), "$.code.coding[0].display", "string").alias("code_desc"),
+    variant_get(col("resource"), "$.performedPeriod.start", "string").alias("performed_start_ts"),
+    variant_get(col("resource"), "$.performedPeriod.end", "string").alias("performed_end_ts"),
+    variant_get(col("resource"), "$.location.reference", "string").alias("location_id"),
+    variant_get(col("resource"), "$.location.display", "string").alias("location_nm"),
+    variant_get(col("resource"), "$.reasonReference[0].reference", "string").alias("reason_id"),
+    col("source_file_nm"),
+)
+
+write_silver_table(procedure_df, "procedure")
 
 # COMMAND ----------
 
@@ -261,9 +420,23 @@ write_silver_table(claim_df, "silver_claim", claim_columns)
 
 # COMMAND ----------
 
-tables = ["silver_patient", "silver_encounter", "silver_condition", 
-          "silver_medication_request", "silver_observation", "silver_claim"]
+tables = ["patient", "encounter", "condition", "medication_request", "observation",
+          "claim", "explanation_of_benefit", "care_team", "care_plan",
+          "diagnostic_report", "document_reference", "immunization", "procedure"]
 
-for table in tables:
-    count = spark.table(f"{SILVER_SCHEMA}.{table}").count()
-    print(f"{table}: {count} rows")
+for t in tables:
+    try:
+        cnt = spark.table(f"{SILVER_SCHEMA}.{t}").count()
+        print(f"{SILVER_SCHEMA}.{t}: {cnt} rows")
+    except Exception as e:
+        print(f"{SILVER_SCHEMA}.{t}: ERROR - {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Cleanup
+
+# COMMAND ----------
+
+# resources_df.unpersist() - not supported in serverless
+spark.sql(f"DROP TABLE IF EXISTS {SILVER_SCHEMA}.bundle_stg")
