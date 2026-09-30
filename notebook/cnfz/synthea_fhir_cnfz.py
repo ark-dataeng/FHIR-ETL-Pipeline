@@ -7,7 +7,7 @@
 # MAGIC # Silver Layer: FHIR Resource Flattening
 # MAGIC
 # MAGIC Flattens nested FHIR Bundles from `workspace.fhir_rawz.bundle_base` into separate Silver tables
-# MAGIC in `workspace.fhir_cnfz`. Each resource type gets its own table.
+# MAGIC Each resource type gets its own table.
 
 # COMMAND ----------
 
@@ -24,12 +24,8 @@ SILVER_SCHEMA = "workspace.fhir_cnfz"
 
 # MAGIC %md
 # MAGIC ## Read Bronze and Explode Bundle Entries
-# MAGIC
-# MAGIC FHIR Bundles contain a nested `entry` array. We explode it to get one row per resource.
 
 # COMMAND ----------
-
-# Build resources_df directly from the VARIANT — no schema inference, no from_json
 resources_df = spark.sql(f"""
     SELECT
         variant_get(e.value, '$.resource',              'variant')  AS resource,
